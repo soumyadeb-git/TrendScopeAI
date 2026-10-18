@@ -1,0 +1,226 @@
+name: Refresh Google Trends and YouTube, then deploy
+
+on:
+  schedule:
+    # Google Trends RSS refresh: near-real-time polling, subject to GitHub scheduling delays.
+    - cron: '*/10 * * * *'
+    # Refresh YouTube search discoveries hourly, separated from the 10-minute Trends run.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      geo:
+        description: Region snapshot to refresh (ALL refreshes all 13 regions)
+        required: true
+        type: choice
+        default: ALL
+        options:
+          - ALL
+          - IN
+          - US
+          - GB
+          - CA
+          - AU
+          - DE
+          - FR
+          - JP
+          - BR
+          - SG
+          - KR
+          - ES
+          - IT
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+# Keep publishing serial so concurrent triggers cannot deploy competing snapshots.
+concurrency:
+  group: trendscope-pages
+  cancel-in-progress: false
+
+jobs:
+  refresh-and-deploy:
+    name: Fetch data and publish static dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          # Intentionally no pip cache: this project does not rely on setup-python cache discovery.
+
+      - name: Ensure every region has valid bootstrap JSON
+        run: python scripts/ensure_snapshots.py
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Restore previously published snapshots
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        shell: bash
+        run: |
+          set -u
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            for kind in trends youtube; do
+              target="data/${kind}-${geo}.json"
+              temporary="${target}.download"
+              url="${BASE_URL%/}/data/${kind}-${geo}.json?refresh=${GITHUB_RUN_ID}"
+
+              if [ -n "${BASE_URL:-}" ] && \
+                 curl --fail --silent --show-error --location \
+                   --retry 1 --max-time 15 "$url" -o "$temporary" 2>/dev/null && \
+                 python -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); assert isinstance(p,dict) and isinstance(p.get("items"),list) and isinstance(p.get("is_live_data"),bool)' "$temporary" >/dev/null 2>&1; then
+                mv "$temporary" "$target"
+                echo "Restored published ${kind} snapshot for ${geo}."
+              else
+                rm -f "$temporary"
+                echo "No published ${kind} snapshot for ${geo}; keeping repository/bootstrap data."
+              fi
+            done
+          done
+
+      - name: Validate code and tests
+        run: |
+          set -e
+          python -m compileall -q scripts tests
+          python -m unittest discover -s tests -v
+          node --check assets/app.js
+          python scripts/ensure_snapshots.py
+
+      - name: Fetch Google Trends RSS snapshots
+        id: trends
+        if: ${{ github.event_name != 'schedule' || github.event.schedule != '7 * * * *' }}
+        continue-on-error: true
+        env:
+          GEO_INPUT: ${{ inputs.geo || 'ALL' }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -e
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            GEO="ALL"
+          else
+            GEO="$GEO_INPUT"
+          fi
+          python scripts/fetch_trends.py --geo "$GEO"
+
+      - name: Install open-source YouTube discovery library
+        id: install-ytdlp
+        if: ${{ github.event_name != 'schedule' || github.event.schedule == '7 * * * *' }}
+        continue-on-error: true
+        run: python -m pip install --disable-pip-version-check --no-input -r requirements.txt
+
+      - name: Back up last-known-good YouTube snapshots
+        if: ${{ github.event_name != 'schedule' || github.event.schedule == '7 * * * *' }}
+        shell: bash
+        run: |
+          set -e
+          mkdir -p /tmp/trendscope-youtube-backup
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            file="data/youtube-${geo}.json"
+            if [ -f "$file" ]; then
+              cp "$file" "/tmp/trendscope-youtube-backup/youtube-${geo}.json"
+            fi
+          done
+
+      - name: Fetch YouTube videos for Google Trends topics
+        id: youtube
+        if: ${{ github.event_name != 'schedule' || github.event.schedule == '7 * * * *' }}
+        continue-on-error: true
+        env:
+          GEO_INPUT: ${{ inputs.geo || 'ALL' }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -e
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            GEO="ALL"
+          else
+            GEO="$GEO_INPUT"
+          fi
+          python scripts/fetch_youtube.py --geo "$GEO"
+
+      - name: Preserve last-known-good YouTube snapshots
+        if: ${{ github.event_name != 'schedule' || github.event.schedule == '7 * * * *' }}
+        shell: bash
+        run: |
+          set -e
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            current="data/youtube-${geo}.json"
+            backup="/tmp/trendscope-youtube-backup/youtube-${geo}.json"
+            [ -f "$current" ] || continue
+
+            if ! python -c '
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as f:
+              p = json.load(f)
+          valid = p.get("is_live_data") is True and isinstance(p.get("items"), list) and len(p["items"]) > 0
+          raise SystemExit(0 if valid else 1)
+          ' "$current"; then
+              if [ -f "$backup" ]; then
+                cp "$backup" "$current"
+                echo "Preserved last-known-good YouTube snapshot for ${geo}."
+              else
+                echo "No previous successful YouTube snapshot for ${geo}; retaining empty, non-live data."
+              fi
+            fi
+          done
+
+      - name: Validate all published JSON snapshots
+        shell: bash
+        run: |
+          set -e
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            for kind in trends youtube; do
+              file="data/${kind}-${geo}.json"
+              test -f "$file"
+              python -m json.tool "$file" >/dev/null
+            done
+          done
+
+      - name: Prepare static website artifact
+        shell: bash
+        run: |
+          set -e
+          rm -rf dist
+          mkdir -p dist
+          cp index.html dist/index.html
+          cp -R assets dist/assets
+          cp -R data dist/data
+          if [ -f CNAME ]; then cp CNAME dist/CNAME; fi
+          touch dist/.nojekyll
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+      - name: Deploy dashboard
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Report external data-source issues without blocking the dashboard
+        if: ${{ steps.trends.outcome == 'failure' || steps.youtube.outcome == 'failure' || steps.install-ytdlp.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::One or more external data collection steps failed or were throttled."
+          echo "The dashboard was still deployed using the latest usable snapshots." 
+          echo "Review the fetch/install logs. No example topics are substituted for live data."

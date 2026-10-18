@@ -1,0 +1,41 @@
+name: Validate TrendScope source
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Ensure bootstrap data exists
+        run: python scripts/ensure_snapshots.py
+
+      - name: Run Python tests
+        run: |
+          python -m compileall -q scripts tests
+          python -m unittest discover -s tests -v
+
+      - name: Check browser JavaScript syntax
+        run: node --check assets/app.js
+
+      - name: Validate JSON snapshots
+        run: |
+          set -e
+          for file in data/trends-*.json data/youtube-*.json; do
+            python -m json.tool "$file" >/dev/null
+          done

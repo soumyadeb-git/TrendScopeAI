@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source": "YouTube search via the open-source yt-dlp library",
+  "region": "JP",
+  "region_name": "Japan",
+  "last_checked_at": null,
+  "last_attempt_at": null,
+  "is_live_data": false,
+  "items": [],
+  "seed_topics": [],
+  "note": "No successful live discovery has completed for this region. Results, when available, are YouTube search discoveries seeded by Google Trends topics, not an official YouTube-wide trending ranking. Search order is not a popularity rank."
+}

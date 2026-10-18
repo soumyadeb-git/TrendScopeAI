@@ -1,0 +1,2 @@
+# Used only by scripts/fetch_youtube.py. Google Trends RSS parsing uses the Python standard library.
+yt-dlp>=2025.10.22

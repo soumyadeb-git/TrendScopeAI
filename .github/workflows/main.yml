@@ -1,0 +1,232 @@
+name: Refresh Google Trends and YouTube Analytics
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      geo:
+        description: "Region to refresh"
+        required: true
+        type: choice
+        default: ALL
+        options:
+          - ALL
+          - IN
+          - US
+          - GB
+          - CA
+          - AU
+          - DE
+          - FR
+          - JP
+          - BR
+          - SG
+          - KR
+          - ES
+          - IT
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  GEO_INPUT: ${{ inputs.geo || 'ALL' }}
+
+jobs:
+  refresh-and-deploy:
+    name: Fetch trends and publish dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Restore previously published snapshots
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p data
+
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            for kind in trends youtube; do
+              target="data/${kind}-${geo}.json"
+              temporary="${target}.download"
+              url="${BASE_URL%/}/data/${kind}-${geo}.json?refresh=${GITHUB_RUN_ID}"
+
+              if [ -n "${BASE_URL:-}" ] &&
+                 curl --fail --silent --show-error \
+                   --location --retry 2 --max-time 15 \
+                   "$url" -o "$temporary" &&
+                 python -m json.tool "$temporary" >/dev/null 2>&1; then
+                mv "$temporary" "$target"
+                echo "Restored previous ${kind} snapshot for ${geo}."
+              else
+                rm -f "$temporary"
+                echo "No previous published ${kind} snapshot for ${geo}."
+              fi
+            done
+          done
+
+      - name: Validate project
+        shell: bash
+        run: |
+          set -e
+
+          python -m unittest discover -s tests -v
+          node --check assets/app.js
+
+          test -f index.html
+          test -f scripts/fetch_trends.py
+          test -f scripts/fetch_youtube.py
+          test -d assets
+          test -d data
+
+      - name: Fetch Google Trends RSS data
+        id: trends
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            python scripts/fetch_trends.py --geo ALL
+          else
+            python scripts/fetch_trends.py --geo "${GEO_INPUT}"
+          fi
+
+      - name: Back up previous YouTube snapshots
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p /tmp/youtube-backup
+
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            source_file="data/youtube-${geo}.json"
+
+            if [ -f "$source_file" ]; then
+              cp "$source_file" "/tmp/youtube-backup/youtube-${geo}.json"
+            fi
+          done
+
+      - name: Install free YouTube discovery library
+        run: |
+          python -m pip install --disable-pip-version-check yt-dlp
+
+      - name: Fetch YouTube videos for trending topics
+        id: youtube
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            GEO_INPUT=ALL python scripts/fetch_youtube.py
+          else
+            python scripts/fetch_youtube.py
+          fi
+
+      - name: Preserve last good YouTube snapshots
+        shell: bash
+        run: |
+          set -e
+
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            current="data/youtube-${geo}.json"
+            backup="/tmp/youtube-backup/youtube-${geo}.json"
+
+            [ -f "$current" ] || continue
+
+            if ! python -c '
+          import json, sys
+          p = json.load(open(sys.argv[1], encoding="utf-8"))
+          valid = p.get("is_live_data") is True and bool(p.get("items"))
+          raise SystemExit(0 if valid else 1)
+          ' "$current"; then
+
+              if [ -f "$backup" ]; then
+                cp "$backup" "$current"
+                echo "Preserved last successful YouTube snapshot for ${geo}."
+              else
+                echo "No previous YouTube snapshot available for ${geo}; retaining the current empty or unavailable result."
+              fi
+            else
+              echo "Verified current YouTube snapshot for ${geo}."
+            fi
+          done
+
+      - name: Validate JSON snapshots
+        shell: bash
+        run: |
+          set -e
+
+          for file in data/trends-*.json data/youtube-*.json; do
+            [ -f "$file" ] || continue
+            python -m json.tool "$file" >/dev/null
+            echo "Valid JSON: $file"
+          done
+
+      - name: Prepare GitHub Pages artifact
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf dist
+          mkdir -p dist
+
+          cp index.html dist/index.html
+          cp -R assets dist/assets
+          cp -R data dist/data
+
+          if [ -f CNAME ]; then
+            cp CNAME dist/CNAME
+          fi
+
+          touch dist/.nojekyll
+
+      - name: Upload static website
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Report data collection failures
+        if: steps.trends.outcome == 'failure' || steps.youtube.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::One or more data collection steps failed."
+          echo "The dashboard was deployed with available snapshots."
+          echo "Check the Google Trends and YouTube step logs."
+          exit 1

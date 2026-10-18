@@ -1,0 +1,148 @@
+name: Refresh Google Trends and deploy dashboard
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      geo:
+        description: "Region snapshot to refresh"
+        required: true
+        type: choice
+        default: ALL
+        options:
+          - ALL
+          - IN
+          - US
+          - GB
+          - CA
+          - AU
+          - DE
+          - FR
+          - JP
+          - BR
+          - SG
+          - KR
+          - ES
+          - IT
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  refresh-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Restore previously published snapshots
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          set -u
+
+          for geo in IN US GB CA AU DE FR JP BR SG KR ES IT; do
+            target="data/trends-${geo}.json"
+            temporary="${target}.download"
+            url="${BASE_URL%/}/data/trends-${geo}.json?refresh=${GITHUB_RUN_ID}"
+
+            if [ -n "$BASE_URL" ] &&
+               curl --fail --silent --show-error --location \
+                 --retry 2 --max-time 15 "$url" -o "$temporary" &&
+               python -m json.tool "$temporary" >/dev/null 2>&1; then
+              mv "$temporary" "$target"
+              echo "Restored previous ${geo} snapshot."
+            else
+              rm -f "$temporary"
+              echo "No valid previous ${geo} snapshot; keeping bootstrap data."
+            fi
+          done
+
+      - name: Test RSS parser
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate JavaScript
+        run: node --check assets/app.js
+
+      - name: Fetch Google Trends RSS snapshots
+        id: fetch
+        continue-on-error: true
+        env:
+          GEO_INPUT: ${{ inputs.geo || 'ALL' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            python scripts/fetch_trends.py --geo ALL
+          else
+            python scripts/fetch_trends.py --geo "$GEO_INPUT"
+          fi
+
+      - name: Validate generated snapshot files
+        run: |
+          set -e
+
+          for file in data/trends-*.json; do
+            [ -f "$file" ] || continue
+            python -m json.tool "$file" >/dev/null
+          done
+
+      - name: Prepare static website artifact
+        run: |
+          set -e
+
+          rm -rf dist
+          mkdir -p dist
+
+          cp index.html dist/index.html
+          cp -R assets dist/assets
+          cp -R data dist/data
+
+          if [ -f CNAME ]; then
+            cp CNAME dist/CNAME
+          fi
+
+          touch dist/.nojekyll
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+      - name: Deploy dashboard and refreshed snapshots
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Report partial feed failures
+        if: steps.fetch.outcome == 'failure'
+        run: |
+          echo "::warning::One or more Google Trends feeds may have failed."
+          echo "The dashboard has been deployed with available snapshots."
+          echo "Check the fetch step logs for details."
+          exit 1
